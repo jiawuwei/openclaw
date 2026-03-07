@@ -1,0 +1,14 @@
+# 微信电话自动化 - Python版本依赖
+# 基本依赖
+pyautogui>=0.9.53
+pillow>=9.0.0
+numpy>=1.21.0
+pyperclip>=1.8.2
+
+# 可选依赖 - 更好的模板匹配
+opencv-python>=4.5.0
+
+# 开发依赖
+pytest>=7.0.0
+black>=22.0.0
+flake8>=4.0.0
