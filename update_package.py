@@ -66,6 +66,37 @@ def remove_docs():
     return True
 
 
+def remove_ui():
+    ui_dir = Path("ui")
+    if not ui_dir.exists():
+        print("⚠ UI folder not found: ui")
+        return False
+
+    shutil.rmtree(ui_dir)
+    print("✓ Deleted ui folder: ui")
+    return True
+
+
+def remove_node_modules():
+    node_modules_dir = Path("node_modules")
+    if not node_modules_dir.exists():
+        print("⚠ node_modules not found: node_modules")
+        return False
+
+    shutil.rmtree(node_modules_dir)
+    print("✓ Deleted node_modules folder: node_modules")
+    return True
+
+
+def run_pnpm_install():
+    print("\n📦 Running pnpm install...")
+    result = subprocess.run(["pnpm", "install"], capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f"✗ pnpm install failed:\n{result.stderr}")
+        sys.exit(1)
+    print("✓ pnpm install completed")
+
+
 def main():
     if len(sys.argv) < 2:
         print("Usage: python update_package.py <new-name>")
@@ -77,6 +108,11 @@ def main():
     if not package_file.exists():
         print("Error: package.json not found")
         sys.exit(1)
+
+    print("\n🧹 Removing node_modules...")
+    remove_node_modules()
+
+    run_pnpm_install()
 
     # Read package.json as text
     with open(package_file, 'r', encoding='utf-8') as f:
@@ -112,6 +148,9 @@ def main():
     print("\n🧹 Removing docs...")
     remove_docs()
 
+    print("\n🧹 Removing ui...")
+    remove_ui()
+
     # Delete current skills folder
     skills_dir = Path("skills")
     if skills_dir.exists():
@@ -125,15 +164,6 @@ def main():
         print(f"✓ Copied skills from {source_skills}")
     else:
         print(f"⚠ Warning: {source_skills} not found")
-
-    # Run pnpm install
-    print("\n📦 Running npm install...")
-    result = subprocess.run(["pnpm", "install"],
-                            capture_output=True, text=True)
-    if result.returncode != 0:
-        print(f"✗ pnpm install failed:\n{result.stderr}")
-        sys.exit(1)
-    print("✓ pnpm install completed")
 
     # Run npm publish
     print("\n📤 Running npm publish...")
