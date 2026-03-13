@@ -8,6 +8,23 @@ import { stripInlineDirectiveTagsForDisplay } from "../utils/directive-tags.js";
 import { loadSessionEntry } from "./session-utils.js";
 import { formatForLog } from "./ws-log.js";
 
+const DEFAULT_CHAT_DELTA_THROTTLE_MS = 120;
+const MAX_CHAT_DELTA_THROTTLE_MS = 2000;
+
+function resolveChatDeltaThrottleMs(): number {
+  const raw = process.env.OPENCLAW_CHAT_DELTA_THROTTLE_MS;
+  if (!raw || !raw.trim()) {
+    return DEFAULT_CHAT_DELTA_THROTTLE_MS;
+  }
+  const parsed = Number.parseInt(raw, 10);
+  if (!Number.isFinite(parsed)) {
+    return DEFAULT_CHAT_DELTA_THROTTLE_MS;
+  }
+  return Math.max(0, Math.min(MAX_CHAT_DELTA_THROTTLE_MS, parsed));
+}
+
+const CHAT_DELTA_THROTTLE_MS = resolveChatDeltaThrottleMs();
+
 function resolveHeartbeatAckMaxChars(): number {
   try {
     const cfg = loadConfig();
@@ -370,7 +387,7 @@ export function createAgentEventHandler({
     }
     const now = Date.now();
     const last = chatRunState.deltaSentAt.get(clientRunId) ?? 0;
-    if (now - last < 150) {
+    if (now - last < CHAT_DELTA_THROTTLE_MS) {
       return;
     }
     chatRunState.deltaSentAt.set(clientRunId, now);
@@ -465,7 +482,7 @@ export function createAgentEventHandler({
     const shouldSuppressSilent =
       normalizedHeartbeatText.suppress || isSilentReplyText(text, SILENT_REPLY_TOKEN);
     // Flush any throttled delta so streaming clients receive the complete text
-    // before the final event. The 150 ms throttle in emitChatDelta may have
+    // before the final event. The delta throttle in emitChatDelta may have
     // suppressed the most recent chunk, leaving the client with stale text.
     // Only flush if the buffer has grown since the last broadcast to avoid duplicates.
     flushBufferedChatDeltaIfNeeded(sessionKey, clientRunId, sourceRunId, seq);
