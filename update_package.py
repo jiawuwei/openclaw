@@ -55,17 +55,6 @@ def remove_extensions(extension_ids):
     return deleted, missing
 
 
-def remove_docs():
-    docs_dir = Path("docs")
-    if not docs_dir.exists():
-        print("⚠ Docs folder not found: docs")
-        return False
-
-    shutil.rmtree(docs_dir)
-    print("✓ Deleted docs folder: docs")
-    return True
-
-
 def remove_ui():
     ui_dir = Path("ui")
     if not ui_dir.exists():
@@ -90,7 +79,8 @@ def remove_node_modules():
 
 def run_pnpm_install():
     print("\n📦 Running pnpm install...")
-    result = subprocess.run(["pnpm", "install"], capture_output=True, text=True)
+    result = subprocess.run(["pnpm", "install"],
+                            capture_output=True, text=True)
     if result.returncode != 0:
         print(f"✗ pnpm install failed:\n{result.stderr}")
         sys.exit(1)
@@ -144,9 +134,6 @@ def main():
     print(f"✓ Extensions processed: {len(deleted)}")
     if missing:
         print(f"⚠ Not found: {', '.join(missing)}")
-
-    print("\n🧹 Removing docs...")
-    remove_docs()
 
     print("\n🧹 Removing ui...")
     remove_ui()
