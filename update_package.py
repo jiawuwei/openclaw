@@ -87,6 +87,16 @@ def run_pnpm_install():
     print("✓ pnpm install completed")
 
 
+def run_pnpm_build():
+    print("\n📦 Running pnpm build...")
+    result = subprocess.run(["pnpm", "build"],
+                            capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f"✗ pnpm build failed:\n{result.stderr}")
+        sys.exit(1)
+    print("✓ pnpm build completed")
+
+
 def main():
     if len(sys.argv) < 2:
         print("Usage: python update_package.py <new-name>")
