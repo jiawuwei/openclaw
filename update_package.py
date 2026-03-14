@@ -113,6 +113,7 @@ def main():
     remove_node_modules()
 
     run_pnpm_install()
+    run_pnpm_build()
 
     # Read package.json as text
     with open(package_file, 'r', encoding='utf-8') as f:
