@@ -418,7 +418,17 @@ def copy_runtime_bundle(output_dir):
 
 def run_publish():
     print("\n📤 Running npm publish...")
-    auth_token = "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"
+    auth_token = first_non_empty(
+        os.environ.get("OPENCLAW_NPM_PUBLISH_TOKEN"),
+        os.environ.get("NPM_PUBLISH_TOKEN"),
+        os.environ.get("NPM_TOKEN"),
+    )
+    if not auth_token:
+        print(
+            "✗ Missing npm publish token. Set OPENCLAW_NPM_PUBLISH_TOKEN in ~/.bash_profile and reload your shell.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
     result = subprocess.run(
         ["npm", "publish", f"--//registry.npmjs.org/:_authToken={auth_token}"],
         cwd=REPO_ROOT,
@@ -477,6 +487,7 @@ def print_usage():
     print("  - Both commands also produce tmp/runtime-archives/<target>/openclaw-runtime.tar.gz")
     print("  - Use --upload-oss to upload the runtime archive and .sha256 via ossutil.")
     print(f"  - Runtime archives are uploaded to oss://<bucket>/{FIXED_OPENCLAW_RUNTIME_OSS_PREFIX}/<target>/")
+    print("  - npm publish reads OPENCLAW_NPM_PUBLISH_TOKEN from the environment.")
 
 
 def parse_cli_args(argv):
