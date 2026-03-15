@@ -1,15 +1,20 @@
 #!/usr/bin/env python3
-import json
+import hashlib
 import os
+import platform
 import re
 import shutil
 import subprocess
 import sys
+import tarfile
+import time
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent
 DEFAULT_RUNTIME_DIR = REPO_ROOT / "tmp" / "runtime" / "openclaw"
+DEFAULT_RUNTIME_ARCHIVE_ROOT = REPO_ROOT / "tmp" / "runtime-archives"
 DEFAULT_SKILLS_SOURCE = Path.home() / "study" / "openclaw" / "agent-skills"
+FIXED_OPENCLAW_RUNTIME_OSS_PREFIX = "assets/openclaw-runtime"
 
 EXTENSIONS = [
     "bluebubbles",
@@ -42,20 +47,58 @@ EXTENSIONS = [
     "copilot-proxy",
 ]
 
-RUNTIME_COPY_RULES = [
-    {"src": Path("openclaw.mjs")},
-    {"src": Path("package.json")},
-    {"src": Path("dist"), "filter": "dist"},
-    {"src": Path("node_modules"), "filter": "node_modules"},
-    {
-        "src": Path("docs") / "reference" / "templates",
-        "dest": Path("docs") / "reference" / "templates",
-    },
-    {"src": Path("extensions"), "optional": True},
-    {"src": Path("skills"), "optional": True},
-    {"src": Path("assets"), "optional": True},
-]
 
+def first_non_empty(*values):
+    for value in values:
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def trim_slash(value):
+    if not value:
+        return ""
+    return value.strip().strip("/")
+
+
+def join_oss_key(*parts):
+    return "/".join(trim_slash(part) for part in parts if trim_slash(part))
+
+
+def normalize_bucket_name(bucket):
+    if not bucket:
+        return None
+    normalized = bucket.strip()
+    if normalized.startswith("oss://"):
+        normalized = normalized[6:]
+    return trim_slash(normalized)
+
+
+def parse_simple_ini(content):
+    data = {}
+    for raw_line in content.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or line.startswith(";") or line.startswith("["):
+            continue
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip().lower()
+        value = value.strip()
+        if key and value:
+            data[key] = value
+    return data
+
+
+def load_ossutil_config():
+    config_path = Path.home() / ".ossutilconfig"
+    if not config_path.exists():
+        return {}
+    try:
+        return parse_simple_ini(config_path.read_text(encoding="utf-8"))
+    except OSError as err:
+        print(f"⚠ Failed to read {config_path}: {err}", file=sys.stderr)
+        return {}
 
 def run_command(args, cwd=REPO_ROOT, capture_output=False, env=None):
     result = subprocess.run(
@@ -111,14 +154,42 @@ def remove_node_modules():
         print("⚠ node_modules not found: node_modules")
         return False
 
-    shutil.rmtree(node_modules_dir)
+    last_error = None
+    for attempt in range(5):
+        try:
+            shutil.rmtree(node_modules_dir)
+            break
+        except FileNotFoundError:
+            break
+        except OSError as err:
+            last_error = err
+            if err.errno != 66 or attempt == 4:
+                raise
+            time.sleep(0.2 * (attempt + 1))
+    else:
+        if last_error is not None:
+            raise last_error
+
     print("✓ Deleted node_modules folder: node_modules")
     return True
 
 
+def sanitized_install_env():
+    env = os.environ.copy()
+    for key in list(env.keys()):
+        if key.lower().startswith("npm_config_"):
+            del env[key]
+    env.pop("NODE_ENV", None)
+    return env
+
+
 def run_pnpm_install():
     print("\n📦 Running pnpm install...")
-    run_command(["pnpm", "install"], capture_output=True)
+    run_command(
+        ["pnpm", "install", "--prod=false"],
+        capture_output=True,
+        env=sanitized_install_env(),
+    )
     print("✓ pnpm install completed")
 
 
@@ -165,157 +236,122 @@ def sync_skills(source_skills=DEFAULT_SKILLS_SOURCE):
         print(f"⚠ Warning: {source_skills} not found")
 
 
-def should_skip_common_path(relative_path):
-    rel = relative_path.replace("\\", "/")
-    return (
-        rel == ".DS_Store"
-        or rel.endswith("/.DS_Store")
-        or rel == ".git"
-        or rel.startswith(".git/")
-        or "/.git/" in rel
-    )
-
-
-def should_skip_dist_path(relative_path):
-    rel = relative_path.replace("\\", "/")
-    return (
-        should_skip_common_path(rel)
-        or rel.endswith(".map")
-        or rel.endswith(".d.ts")
-        or rel.endswith(".d.mts")
-        or rel.endswith(".d.cts")
-    )
-
-
-def should_skip_node_modules_path(relative_path):
-    rel = relative_path.replace("\\", "/")
-    return (
-        rel == ".modules.yaml"
-        or rel == ".pnpm-workspace-state-v1.json"
-        or rel == ".pnpm"
-        or rel.startswith(".pnpm/")
-        or "/.pnpm/" in rel
-        or should_skip_common_path(rel)
-    )
-
-
-def should_skip_path(relative_path, filter_name=None):
-    if filter_name == "dist":
-        return should_skip_dist_path(relative_path)
-    if filter_name == "node_modules":
-        return should_skip_node_modules_path(relative_path)
-    return should_skip_common_path(relative_path)
-
-
-def build_copytree_ignore(src_dir, filter_name):
-    src_dir = Path(src_dir)
-
-    def ignore(current_dir, names):
-        current_path = Path(current_dir)
-        rel_dir = Path(".") if current_path == src_dir else current_path.relative_to(src_dir)
-        ignored = []
-        for name in names:
-            rel_path = name if rel_dir == Path(".") else (rel_dir / name).as_posix()
-            if should_skip_path(rel_path, filter_name):
-                ignored.append(name)
-        return ignored
-
-    return ignore
-
-
-def get_runtime_top_level_node_modules_allowlist():
-    package_file = REPO_ROOT / "package.json"
-    package_data = json.loads(package_file.read_text(encoding="utf-8"))
-    allowlist = {".bin"}
-
-    for section_name in ("dependencies", "peerDependencies"):
-        section = package_data.get(section_name) or {}
-        for package_name in section.keys():
-            if package_name.startswith("@"):
-                allowlist.add(package_name.split("/", 1)[0])
-            else:
-                allowlist.add(package_name)
-
-    return allowlist
-
-
-def prune_top_level_node_modules(dest_dir):
-    allowlist = get_runtime_top_level_node_modules_allowlist()
-    for entry in dest_dir.iterdir():
-        if entry.name in allowlist:
-            continue
-        if entry.is_dir() and not entry.is_symlink():
-            shutil.rmtree(entry)
-        else:
-            entry.unlink()
-
-
-def copy_node_modules(src_dir, dest_dir):
-    dest_dir.parent.mkdir(parents=True, exist_ok=True)
-    run_command(
-        [
-            "rsync",
-            "-aL",
-            "--exclude",
-            ".pnpm/",
-            "--exclude",
-            ".modules.yaml",
-            "--exclude",
-            ".pnpm-workspace-state-v1.json",
-            "--exclude",
-            ".DS_Store",
-            "--exclude",
-            ".git/",
-            f"{src_dir}/",
-            str(dest_dir),
-        ],
-        capture_output=True,
-    )
-    prune_top_level_node_modules(dest_dir)
-
-
-def copy_directory(src_dir, dest_dir, filter_name=None):
-    if filter_name == "node_modules":
-        copy_node_modules(src_dir, dest_dir)
-        return
-
-    for root, dirnames, filenames in os.walk(src_dir, followlinks=False):
-        root_path = Path(root)
-        rel_root = Path(".") if root_path == src_dir else root_path.relative_to(src_dir)
-        current_dest = dest_dir if rel_root == Path(".") else dest_dir / rel_root
-        current_dest.mkdir(parents=True, exist_ok=True)
-
-        kept_dirs = []
+def prune_bin_directories(root_dir):
+    removed = 0
+    for current_root, dirnames, _ in os.walk(root_dir, topdown=True):
+        kept_dirnames = []
         for dirname in dirnames:
-            rel_path = dirname if rel_root == Path(".") else (rel_root / dirname).as_posix()
-            if should_skip_path(rel_path, filter_name):
+            if dirname != ".bin":
+                kept_dirnames.append(dirname)
                 continue
-            dir_path = root_path / dirname
-            if dir_path.is_symlink():
-                target = dir_path.resolve(strict=False)
-                if not target.exists():
-                    print(f"⚠ Skipped broken symlink directory: {dir_path} -> {target}")
-                continue
-            kept_dirs.append(dirname)
-        dirnames[:] = kept_dirs
+            shutil.rmtree(Path(current_root) / dirname)
+            removed += 1
+        dirnames[:] = kept_dirnames
+    if removed:
+        print(f"✓ Removed {removed} node_modules/.bin directories")
 
-        for filename in filenames:
-            rel_path = filename if rel_root == Path(".") else (rel_root / filename).as_posix()
-            if should_skip_path(rel_path, filter_name):
-                continue
-            src_file = root_path / filename
-            if src_file.is_symlink():
-                target = src_file.resolve(strict=False)
-                if not target.exists():
-                    print(f"⚠ Skipped broken symlink file: {src_file} -> {target}")
-                    continue
-                if target.is_dir():
-                    print(f"⚠ Skipped symlink-to-directory file entry: {src_file} -> {target}")
-                    continue
-                src_file = target
-            dest_file = dest_dir / rel_path
-            dest_file.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(src_file, dest_file)
+
+def count_symlinks(root_dir):
+    if not root_dir.exists():
+        return 0
+
+    count = 0
+    for path in root_dir.rglob("*"):
+        if path.is_symlink():
+            count += 1
+    return count
+
+
+def detect_runtime_target():
+    system = platform.system()
+    machine = platform.machine().lower()
+
+    if system == "Darwin":
+        arch = "aarch64" if machine == "arm64" else "x86_64"
+        return f"{arch}-apple-darwin"
+    if system == "Linux":
+        arch = "aarch64" if machine in {"aarch64", "arm64"} else "x86_64"
+        return f"{arch}-unknown-linux-gnu"
+    if system == "Windows":
+        return "x86_64-pc-windows-msvc"
+
+    print(f"✗ Unsupported runtime platform: {system}/{machine}", file=sys.stderr)
+    sys.exit(1)
+
+
+def compute_sha256(file_path):
+    digest = hashlib.sha256()
+    with file_path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def create_runtime_archive(runtime_dir, target_triple, archive_root=DEFAULT_RUNTIME_ARCHIVE_ROOT):
+    archive_dir = archive_root / target_triple
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    archive_path = archive_dir / "openclaw-runtime.tar.gz"
+    sha_path = archive_dir / "openclaw-runtime.tar.gz.sha256"
+
+    print(f"\n📦 Creating runtime archive: {archive_path}")
+    if archive_path.exists():
+        archive_path.unlink()
+    with tarfile.open(archive_path, "w:gz") as tar:
+        tar.add(runtime_dir, arcname="openclaw")
+
+    sha256 = compute_sha256(archive_path)
+    sha_path.write_text(f"{sha256}\n", encoding="utf-8")
+    print(f"✓ Runtime archive ready: {archive_path}")
+    print(f"✓ Runtime archive SHA256: {sha256}")
+    return archive_path, sha_path, sha256
+
+
+def resolve_runtime_oss_settings():
+    config = load_ossutil_config()
+    bucket = normalize_bucket_name(
+        first_non_empty(os.environ.get("OSS_BUCKET"), config.get("bucket"), "totou")
+    )
+    return {
+        "bucket": bucket,
+        "runtime_prefix": FIXED_OPENCLAW_RUNTIME_OSS_PREFIX,
+        "config_path": Path.home() / ".ossutilconfig",
+    }
+
+
+def build_runtime_oss_keys(target_triple, runtime_prefix):
+    runtime_root = join_oss_key(runtime_prefix, target_triple)
+    archive_key = join_oss_key(runtime_root, "openclaw-runtime.tar.gz")
+    sha_key = join_oss_key(runtime_root, "openclaw-runtime.tar.gz.sha256")
+    return archive_key, sha_key
+
+
+def upload_runtime_archive(archive_path, sha_path, target_triple):
+    settings = resolve_runtime_oss_settings()
+    ossutil_path = shutil.which("ossutil")
+    if not ossutil_path:
+        print("✗ ossutil not found in PATH", file=sys.stderr)
+        sys.exit(1)
+    if not settings["config_path"].exists():
+        print(f"✗ ossutil config not found: {settings['config_path']}", file=sys.stderr)
+        sys.exit(1)
+
+    archive_key, sha_key = build_runtime_oss_keys(target_triple, settings["runtime_prefix"])
+    archive_target = f"oss://{settings['bucket']}/{archive_key}"
+    sha_target = f"oss://{settings['bucket']}/{sha_key}"
+
+    print("\n📤 Uploading runtime archive to OSS...")
+    print(f"  {archive_path} -> {archive_target}")
+    run_command(["ossutil", "cp", "-f", str(archive_path), archive_target], capture_output=True)
+    print(f"  {sha_path} -> {sha_target}")
+    run_command(["ossutil", "cp", "-f", str(sha_path), sha_target], capture_output=True)
+    print("✓ Runtime archive uploaded to OSS")
+
+
+def package_runtime_artifacts(runtime_dir, upload_oss=False):
+    target_triple = detect_runtime_target()
+    archive_path, sha_path, _ = create_runtime_archive(runtime_dir, target_triple)
+    if upload_oss:
+        upload_runtime_archive(archive_path, sha_path, target_triple)
 
 
 def copy_runtime_bundle(output_dir):
@@ -328,9 +364,30 @@ def copy_runtime_bundle(output_dir):
 
     print(f"\n📦 Building OpenClaw runtime directory: {output_dir}")
     run_command(
-        ["pnpm", "--filter", ".", "deploy", "--legacy", "--prod", str(staging_dir)],
+        [
+            "pnpm",
+            "--filter",
+            ".",
+            "deploy",
+            "--legacy",
+            "--prod",
+            "--config.node-linker=hoisted",
+            "--config.package-import-method=copy",
+            str(staging_dir),
+        ],
         capture_output=True,
     )
+
+    print("\n🧹 Removing node_modules/.bin symlink directories...")
+    prune_bin_directories(staging_dir)
+
+    symlink_count = count_symlinks(staging_dir)
+    if symlink_count != 0:
+        print(
+            f"✗ Runtime directory still contains symlinks after deploy: {symlink_count}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
     runtime_env = os.environ.copy()
     runtime_env["NODE_DISABLE_COMPILE_CACHE"] = "1"
@@ -397,44 +454,77 @@ def run_slim_pipeline(new_name=None):
     sync_skills()
 
 
-def run_slim_and_publish(new_name, runtime_dir=DEFAULT_RUNTIME_DIR):
+def run_slim_and_publish(new_name, runtime_dir=DEFAULT_RUNTIME_DIR, upload_oss=False):
     run_slim_pipeline(new_name)
-    copy_runtime_bundle(runtime_dir)
+    runtime_dir = copy_runtime_bundle(runtime_dir)
+    package_runtime_artifacts(runtime_dir, upload_oss=upload_oss)
     run_publish()
 
 
-def run_slim_and_build_runtime(runtime_dir=DEFAULT_RUNTIME_DIR):
+def run_slim_and_build_runtime(runtime_dir=DEFAULT_RUNTIME_DIR, upload_oss=False):
     run_slim_pipeline()
-    copy_runtime_bundle(runtime_dir)
+    runtime_dir = copy_runtime_bundle(runtime_dir)
+    package_runtime_artifacts(runtime_dir, upload_oss=upload_oss)
 
 
 def print_usage():
     print("Usage:")
-    print("  python update_package.py <new-name> [runtime-output-dir]")
-    print("  python update_package.py build-runtime [output-dir]")
+    print("  python update_package.py <new-name> [runtime-output-dir] [--upload-oss]")
+    print("  python update_package.py build-runtime [output-dir] [--upload-oss]")
     print("")
     print("Notes:")
     print("  - Both commands run the slimming flow first.")
-    print("  - The publish command also exports runtime before npm publish.")
+    print("  - Both commands also produce tmp/runtime-archives/<target>/openclaw-runtime.tar.gz")
+    print("  - Use --upload-oss to upload the runtime archive and .sha256 via ossutil.")
+    print(f"  - Runtime archives are uploaded to oss://<bucket>/{FIXED_OPENCLAW_RUNTIME_OSS_PREFIX}/<target>/")
+
+
+def parse_cli_args(argv):
+    upload_oss = False
+    positionals = []
+
+    index = 1
+    while index < len(argv):
+        arg = argv[index]
+        if arg == "--upload-oss":
+            upload_oss = True
+        else:
+            positionals.append(arg)
+        index += 1
+
+    return {
+        "positionals": positionals,
+        "upload_oss": upload_oss,
+    }
 
 
 def main():
-    if len(sys.argv) < 2:
+    parsed = parse_cli_args(sys.argv)
+    positionals = parsed["positionals"]
+
+    if len(positionals) < 1:
         print_usage()
         sys.exit(1)
 
-    if sys.argv[1] in {"-h", "--help"}:
+    if positionals[0] in {"-h", "--help"}:
         print_usage()
         sys.exit(0)
 
-    if sys.argv[1] == "build-runtime":
-        output_dir = Path(sys.argv[2]) if len(sys.argv) >= 3 else DEFAULT_RUNTIME_DIR
-        run_slim_and_build_runtime(output_dir)
+    if positionals[0] == "build-runtime":
+        output_dir = Path(positionals[1]) if len(positionals) >= 2 else DEFAULT_RUNTIME_DIR
+        run_slim_and_build_runtime(
+            output_dir,
+            upload_oss=parsed["upload_oss"],
+        )
         sys.exit(0)
 
-    new_name = sys.argv[1]
-    runtime_dir = Path(sys.argv[2]) if len(sys.argv) >= 3 else DEFAULT_RUNTIME_DIR
-    run_slim_and_publish(new_name, runtime_dir)
+    new_name = positionals[0]
+    runtime_dir = Path(positionals[1]) if len(positionals) >= 2 else DEFAULT_RUNTIME_DIR
+    run_slim_and_publish(
+        new_name,
+        runtime_dir,
+        upload_oss=parsed["upload_oss"],
+    )
 
 
 if __name__ == "__main__":
