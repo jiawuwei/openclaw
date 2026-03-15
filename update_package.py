@@ -100,14 +100,28 @@ def load_ossutil_config():
         print(f"⚠ Failed to read {config_path}: {err}", file=sys.stderr)
         return {}
 
+
+def resolve_executable(command):
+    command_path = Path(command)
+    if command_path.is_absolute() or command_path.parent != Path("."):
+        return str(command_path)
+    resolved = shutil.which(command)
+    return resolved or command
+
+
 def run_command(args, cwd=REPO_ROOT, capture_output=False, env=None):
-    result = subprocess.run(
-        args,
-        cwd=cwd,
-        capture_output=capture_output,
-        text=True,
-        env=env,
-    )
+    resolved_args = [resolve_executable(args[0]), *args[1:]]
+    try:
+        result = subprocess.run(
+            resolved_args,
+            cwd=cwd,
+            capture_output=capture_output,
+            text=True,
+            env=env,
+        )
+    except FileNotFoundError:
+        print(f"✗ Command not found: {args[0]}", file=sys.stderr)
+        sys.exit(1)
     if result.returncode != 0:
         if capture_output:
             if result.stdout:
@@ -311,10 +325,29 @@ def resolve_runtime_oss_settings():
     bucket = normalize_bucket_name(
         first_non_empty(os.environ.get("OSS_BUCKET"), config.get("bucket"), "totou")
     )
+    endpoint = first_non_empty(
+        os.environ.get("OSS_ENDPOINT"),
+        config.get("endpoint"),
+        "oss-cn-beijing.aliyuncs.com",
+    )
+    access_key_id = first_non_empty(
+        os.environ.get("OSS_ACCESS_KEY_ID"),
+        os.environ.get("ALICLOUD_ACCESS_KEY_ID"),
+        os.environ.get("ALIBABA_CLOUD_ACCESS_KEY_ID"),
+        config.get("accesskeyid"),
+    )
+    access_key_secret = first_non_empty(
+        os.environ.get("OSS_ACCESS_KEY_SECRET"),
+        os.environ.get("ALICLOUD_ACCESS_KEY_SECRET"),
+        os.environ.get("ALIBABA_CLOUD_ACCESS_KEY_SECRET"),
+        config.get("accesskeysecret"),
+    )
     return {
         "bucket": bucket,
+        "endpoint": endpoint,
+        "access_key_id": access_key_id,
+        "access_key_secret": access_key_secret,
         "runtime_prefix": FIXED_OPENCLAW_RUNTIME_OSS_PREFIX,
-        "config_path": Path.home() / ".ossutilconfig",
     }
 
 
@@ -327,23 +360,39 @@ def build_runtime_oss_keys(target_triple, runtime_prefix):
 
 def upload_runtime_archive(archive_path, sha_path, target_triple):
     settings = resolve_runtime_oss_settings()
-    ossutil_path = shutil.which("ossutil")
-    if not ossutil_path:
-        print("✗ ossutil not found in PATH", file=sys.stderr)
+    missing = []
+    if not settings["bucket"]:
+        missing.append("bucket")
+    if not settings["endpoint"]:
+        missing.append("endpoint")
+    if not settings["access_key_id"]:
+        missing.append("access_key_id")
+    if not settings["access_key_secret"]:
+        missing.append("access_key_secret")
+    if missing:
+        print(f"✗ Missing OSS settings for upload: {', '.join(missing)}", file=sys.stderr)
         sys.exit(1)
-    if not settings["config_path"].exists():
-        print(f"✗ ossutil config not found: {settings['config_path']}", file=sys.stderr)
+
+    try:
+        import oss2
+    except ImportError:
+        print("✗ Missing Python package: oss2. Please install it with `pip install oss2`.", file=sys.stderr)
         sys.exit(1)
 
     archive_key, sha_key = build_runtime_oss_keys(target_triple, settings["runtime_prefix"])
     archive_target = f"oss://{settings['bucket']}/{archive_key}"
     sha_target = f"oss://{settings['bucket']}/{sha_key}"
+    endpoint = settings["endpoint"]
+    if not endpoint.startswith("http://") and not endpoint.startswith("https://"):
+        endpoint = f"https://{endpoint}"
+    auth = oss2.Auth(settings["access_key_id"], settings["access_key_secret"])
+    bucket = oss2.Bucket(auth, endpoint, settings["bucket"])
 
     print("\n📤 Uploading runtime archive to OSS...")
     print(f"  {archive_path} -> {archive_target}")
-    run_command(["ossutil", "cp", "-f", str(archive_path), archive_target], capture_output=True)
+    bucket.put_object_from_file(archive_key, str(archive_path))
     print(f"  {sha_path} -> {sha_target}")
-    run_command(["ossutil", "cp", "-f", str(sha_path), sha_target], capture_output=True)
+    bucket.put_object_from_file(sha_key, str(sha_path))
     print("✓ Runtime archive uploaded to OSS")
 
 
@@ -429,15 +478,11 @@ def run_publish():
             file=sys.stderr,
         )
         sys.exit(1)
-    result = subprocess.run(
+    result = run_command(
         ["npm", "publish", f"--//registry.npmjs.org/:_authToken={auth_token}"],
         cwd=REPO_ROOT,
         capture_output=True,
-        text=True,
     )
-    if result.returncode != 0:
-        print(f"✗ npm publish failed:\n{result.stderr}")
-        sys.exit(1)
     print("✓ npm publish completed")
     print(result.stdout)
 
@@ -485,7 +530,7 @@ def print_usage():
     print("Notes:")
     print("  - Both commands run the slimming flow first.")
     print("  - Both commands also produce tmp/runtime-archives/<target>/openclaw-runtime.tar.gz")
-    print("  - Use --upload-oss to upload the runtime archive and .sha256 via ossutil.")
+    print("  - Use --upload-oss to upload the runtime archive and .sha256 via Python oss2 SDK.")
     print(f"  - Runtime archives are uploaded to oss://<bucket>/{FIXED_OPENCLAW_RUNTIME_OSS_PREFIX}/<target>/")
     print("  - npm publish reads OPENCLAW_NPM_PUBLISH_TOKEN from the environment.")
 
